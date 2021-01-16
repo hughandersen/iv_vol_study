@@ -1,0 +1,267 @@
+---
+title: "implied vol study"
+author: "Hugh Andersen"
+date: "11 January 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(alchemy)
+library(tidyverse)
+library(lubridate)
+library(broom)
+library(IBrokers)
+library(readxl)
+library(writexl)
+library(RQuantLib)
+
+
+```
+
+
+## import saved historical data
+
+```{r}
+
+skew_data <- read.csv("hsi_skew_study_20210128.csv")
+
+```
+
+
+
+
+
+# 1.0 Get futures and options prices
+
+```{r}
+
+expiry_choice <- "20201230"
+
+```
+## 1.1 futures prices
+
+```{r}
+
+tws <-  twsConnect() 
+
+hsi_futures_contract <- twsFuture(symbol="HSI",
+                       primary="",
+                       right="",
+                       local="",
+                       exch="HKFE",
+                       expiry=expiry_choice,
+                       currency="HKD",
+                       multiplier="50")
+
+
+hsi_last <- as.data.frame(reqHistoricalData(tws,Contract=hsi_futures_contract,duration="60 D")) %>% 
+  rownames_to_column(var="date") %>% 
+    `colnames<-`(c("date","open","high","low","close","volume","wap","hasgaps","count")) %>% 
+  mutate(
+    return=(close-lag(close))/lag(close)
+  )
+
+min_px <- 200*ceiling(min(hsi_last$close)/200)
+max_px <- 200*ceiling(max(hsi_last$close)/200)
+mid_px <- (max_px+min_px)/2
+
+write.csv(hsi_last,"hsi_last.csv",row.names = FALSE)
+
+```
+
+### 1.2 options prices
+
+```{r}
+
+tws <-  twsConnect() 
+
+#   debug(fn_get_history)
+fn_get_history <- function(strike,right,expiry_choice){
+  
+ contract <-  twsContract(0,
+                           symbol="HSI",
+                           sectype="OPT",
+                           exch="HKFE",
+                           primary="",
+                           expiry=expiry_choice,
+                           strike=as.character(strike),
+                           currency="HKD",
+                           right=as.character(right),
+                           local="",
+                           multiplier = "50",
+                           combo_legs_desc = "",
+                           comboleg = "",
+                           include_expired = "",
+                           secIdType = "",
+                           secId = "")
+  
+px_data <- reqHistoricalData(tws,Contract=contract,duration="40 D")
+
+df <- data.frame(px_data) %>% 
+  rownames_to_column(var="date") %>% 
+  `colnames<-`(c("date","open","high","low","close","volume","wap","hasgaps","count")) %>% 
+  mutate(
+    strike=strike,
+    right=right
+  ) %>% 
+  select(date,strike,right,close)
+
+  return(df)
+}
+
+strikes <- seq(from=min_px-600,to=max_px+600,by=200) 
+
+px_list <- list()
+x <- 1
+
+for(r in 1:2){
+  if(r==1) right <- "C"
+  if(r==2) right <- "P"
+  
+  for(k in 1:length(strikes)){
+  # for(k in 1:3){
+    px_list[[x]] <-  fn_get_history(strike=strikes[k],right=right,expiry_choice=expiry_choice)
+    x <- x+1
+  }
+}
+
+skew_data <- do.call("rbind", px_list)  %>% 
+  left_join(hsi_last %>% select(date,close),by="date",suffix=c("_option","_future")) %>% 
+  mutate(
+    strike=as.numeric(strike),
+    dte=as.numeric(dmy("21012021")-ymd(date))/365,
+    right=ifelse(right=="C","call","put"),
+    k=as.numeric(strike)/close_future
+  ) %>%
+  drop_na() %>%
+  filter(
+  (k>1 & right=="call") | (k<1 & right=="put")
+  ) %>% 
+  rowwise() %>%
+  mutate(
+    iv=as.numeric(EuropeanOptionImpliedVolatility(type=right,
+                                                  value=close_option,
+                                                  underlying=close_future,
+                                                  strike=strike,
+                                                  dividendYield=0,
+                                                  riskFreeRate=0.75/100,
+                                                  maturity=dte,
+                                                  volatility = 0.4))
+  )
+
+filename <- paste0("hsi_skew_study_",expiry_choice,".csv")
+write.csv(skew_data,filename,row.names = F)
+
+
+```
+
+# 2.0 calculate coeffs
+
+
+```{r}
+
+# mod_fit <- function(data) {
+#   lm(iv ~ k, data = data)
+# }
+
+model_poly <- function(df){
+  lm(iv ~  k + I(k^2),data=df)
+}
+
+
+skew_model <- skew_data %>% 
+  select(date,k,iv) %>% 
+  group_nest(date) %>% 
+   mutate(model = map(data, model_poly))
+
+skew_summary <- skew_model %>% 
+  mutate(
+    glance = map(model, broom::glance),
+    tidy = map(model, broom::tidy),
+    augment = map(model, broom::augment)
+  )
+
+
+```
+
+
+# 3.0 analysis of skew curve
+
+```{r}
+
+coeffs <- skew_summary %>% 
+  unnest(tidy) %>% 
+  select(date,term,estimate) %>% 
+  mutate(
+    term=case_when(
+      term=="(Intercept)"~"b0",
+      term=="k"~"b1",
+      term=="I(k^2)"~"b2"
+    )
+  ) %>% 
+  pivot_wider(names_from=term,values_from=estimate) %>% 
+  mutate(
+    k=list(seq(from=0.96,to=1.04,by=0.005))
+  ) %>% 
+  unnest(cols=k) %>% 
+  mutate(
+    iv=b0+b1*k+b2*k^2
+  )
+
+#skew curve over time
+coeffs %>% 
+  filter(b1<0) %>% 
+  ggplot()+
+  aes(x=k,y=iv,colour=as.factor(date))+
+  geom_line()+
+  labs(
+    title="IV vs k by date"
+  )
+
+
+#atm iv vs date
+coeffs %>% 
+  filter(k==1) %>% 
+  ggplot()+
+  aes(x=ymd(date),y=iv)+
+  geom_point()+
+  geom_line()+
+  labs(
+    title="IV for k=1 by date"
+  )
+
+
+#atm iv change vs date
+coeffs %>% 
+  filter(k==1) %>%
+  mutate(
+    iv_change=iv-lag(iv)
+  ) %>% 
+  ggplot()+
+  aes(x=ymd(date),y=100*iv_change)+
+  geom_point()+
+  geom_line()+
+  labs(
+    title="IV change for k=1 by date",
+    y="Percent IV change",
+    x="Date"
+  )
+
+df <- coeffs %>% 
+  filter(k==1) %>%
+  left_join(hsi_last %>% select(date,return),by="date") %>% 
+  drop_na() %>% 
+  select(date,iv,return) %>% 
+  pivot_longer(cols=-date,names_to="variable",values_to="values")
+
+df %>% 
+  ggplot()+
+  aes(x=date,y=values,colour=variable)+ 
+  geom_point()
+
+```
+
+
+
